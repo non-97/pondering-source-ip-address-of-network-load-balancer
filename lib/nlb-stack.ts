@@ -2,6 +2,7 @@ import {
   RemovalPolicy,
   Stack,
   StackProps,
+  aws_logs as logs,
   aws_iam as iam,
   aws_ec2 as ec2,
   aws_s3 as s3,
@@ -16,7 +17,12 @@ export class NlbStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    // IAM Role
+    // CloudWatch Logs Log Group for VPC Flow Logs
+    const flowLogsLogGroup = new logs.LogGroup(this, "Flow Logs Log Group", {
+      retention: logs.RetentionDays.ONE_WEEK,
+    });
+
+    // SSM IAM Role
     const ssmIamRole = new iam.Role(this, "SSM IAM Role", {
       assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
       managedPolicies: [
@@ -25,6 +31,34 @@ export class NlbStack extends Stack {
         ),
       ],
     });
+
+    // VPC Flow Logs IAM role
+    const flowLogsIamRole = new iam.Role(this, "Flow Logs IAM Role", {
+      assumedBy: new iam.ServicePrincipal("vpc-flow-logs.amazonaws.com"),
+    });
+
+    // Create VPC Flow Logs IAM Policy
+    const flowLogsIamPolicy = new iam.Policy(this, "Flow Logs IAM Policy", {
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["iam:PassRole"],
+          resources: [flowLogsIamRole.roleArn],
+        }),
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+            "logs:DescribeLogStreams",
+          ],
+          resources: [flowLogsLogGroup.logGroupArn],
+        }),
+      ],
+    });
+
+    // Attach VPC Flow Logs IAM Policy
+    flowLogsIamRole.attachInlinePolicy(flowLogsIamPolicy);
 
     // VPC
     const providerVPC = new ec2.Vpc(this, "Provider VPC", {
@@ -42,6 +76,17 @@ export class NlbStack extends Stack {
         },
       ],
     });
+    new ec2.CfnFlowLog(this, "Provider VPC Flow Log ", {
+      resourceId: providerVPC.vpcId,
+      resourceType: "VPC",
+      trafficType: "ALL",
+      deliverLogsPermissionArn: flowLogsIamRole.roleArn,
+      logDestination: flowLogsLogGroup.logGroupArn,
+      logDestinationType: "cloud-watch-logs",
+      logFormat:
+        "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} ${region} ${az-id} ${sublocation-type} ${sublocation-id} ${pkt-src-aws-service} ${pkt-dst-aws-service} ${flow-direction} ${traffic-path}",
+      maxAggregationInterval: 60,
+    });
 
     const consumerVPC = new ec2.Vpc(this, "Consumer VPC", {
       cidr: "10.11.0.0/24",
@@ -57,6 +102,17 @@ export class NlbStack extends Stack {
           cidrMask: 28,
         },
       ],
+    });
+    new ec2.CfnFlowLog(this, "Consumer VPC Flow Log ", {
+      resourceId: consumerVPC.vpcId,
+      resourceType: "VPC",
+      trafficType: "ALL",
+      deliverLogsPermissionArn: flowLogsIamRole.roleArn,
+      logDestination: flowLogsLogGroup.logGroupArn,
+      logDestinationType: "cloud-watch-logs",
+      logFormat:
+        "${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr} ${region} ${az-id} ${sublocation-type} ${sublocation-id} ${pkt-src-aws-service} ${pkt-dst-aws-service} ${flow-direction} ${traffic-path}",
+      maxAggregationInterval: 60,
     });
 
     // VPC Peering
@@ -126,35 +182,6 @@ export class NlbStack extends Stack {
     userDataProviderEC2Instance.addCommands(
       userDataProviderEC2InstanceParameter
     );
-
-    // Network ACL
-    const providerVPCIsolatedSubnetNetworkACL = new ec2.NetworkAcl(
-      this,
-      "Provider VPC Isolated subnet Network ACL",
-      {
-        vpc: providerVPC,
-        subnetSelection: {
-          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
-        },
-      }
-    );
-    providerVPCIsolatedSubnetNetworkACL.addEntry(
-      "Allow ingress traffic from Provider VPC",
-      {
-        cidr: ec2.AclCidr.ipv4(providerVPC.vpcCidrBlock),
-        ruleNumber: 10,
-        traffic: ec2.AclTraffic.allTraffic(),
-        direction: ec2.TrafficDirection.INGRESS,
-        ruleAction: ec2.Action.ALLOW,
-      }
-    );
-    providerVPCIsolatedSubnetNetworkACL.addEntry("Allow all egress traffic", {
-      cidr: ec2.AclCidr.anyIpv4(),
-      ruleNumber: 20,
-      traffic: ec2.AclTraffic.allTraffic(),
-      direction: ec2.TrafficDirection.EGRESS,
-      ruleAction: ec2.Action.ALLOW,
-    });
 
     // Security Group
     const providerEC2InstanceSG = new ec2.SecurityGroup(
@@ -308,22 +335,22 @@ export class NlbStack extends Stack {
     );
 
     // ALB
-    const alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
-      vpc: providerVPC,
-      vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
-      },
-      securityGroup: albSG,
-    });
-    alb.logAccessLogs(albAccessLogBucket);
+    // const alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
+    //   vpc: providerVPC,
+    //   vpcSubnets: {
+    //     subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+    //   },
+    //   securityGroup: albSG,
+    // });
+    // alb.logAccessLogs(albAccessLogBucket);
 
-    const albListener = alb.addListener("ALB Listener", {
-      port: 80,
-    });
-    albListener.addTargets("ALB Targets", {
-      port: 80,
-      targets: [new elbv2Targets.InstanceTarget(providerEC2Instance, 80)],
-    });
+    // const albListener = alb.addListener("ALB Listener", {
+    //   port: 80,
+    // });
+    // albListener.addTargets("ALB Targets", {
+    //   port: 80,
+    //   targets: [new elbv2Targets.InstanceTarget(providerEC2Instance, 80)],
+    // });
 
     // NLB
     const nlb = new elbv2.NetworkLoadBalancer(this, "NLB", {
@@ -338,13 +365,13 @@ export class NlbStack extends Stack {
     nlbListener.addTargets("NLB Targets", {
       protocol: elbv2.Protocol.TCP,
       port: 80,
-      // preserveClientIp: false,
+      preserveClientIp: false,
       // preserveClientIp: true,
-      // targets: [new elbv2Targets.InstanceTarget(providerEC2Instance, 80)],
+      targets: [new elbv2Targets.InstanceTarget(providerEC2Instance, 80)],
       // targets: [
       //   new elbv2Targets.IpTarget(providerEC2Instance.instancePrivateIp, 80),
       // ],
-      targets: [new elbv2Targets.AlbTarget(alb, 80)],
+      // targets: [new elbv2Targets.AlbTarget(alb, 80)],
     });
 
     // VPC Endpoint service
@@ -383,6 +410,35 @@ export class NlbStack extends Stack {
         subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
       }),
       securityGroups: [vpcEndpointSGOnProviderVPC],
+    });
+
+    // Network ACL
+    const providerVPCIsolatedSubnetNetworkACL = new ec2.NetworkAcl(
+      this,
+      "Provider VPC Isolated subnet Network ACL",
+      {
+        vpc: providerVPC,
+        subnetSelection: {
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+        },
+      }
+    );
+    providerVPCIsolatedSubnetNetworkACL.addEntry(
+      "Allow ingress traffic from target instance",
+      {
+        cidr: ec2.AclCidr.ipv4(`${providerEC2Instance.instancePrivateIp}/32`),
+        ruleNumber: 100,
+        traffic: ec2.AclTraffic.allTraffic(),
+        direction: ec2.TrafficDirection.INGRESS,
+        ruleAction: ec2.Action.ALLOW,
+      }
+    );
+    providerVPCIsolatedSubnetNetworkACL.addEntry("Allow all egress traffic", {
+      cidr: ec2.AclCidr.anyIpv4(),
+      ruleNumber: 100,
+      traffic: ec2.AclTraffic.allTraffic(),
+      direction: ec2.TrafficDirection.EGRESS,
+      ruleAction: ec2.Action.ALLOW,
     });
   }
 }
