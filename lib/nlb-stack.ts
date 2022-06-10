@@ -1,9 +1,10 @@
 import {
-  Fn,
+  RemovalPolicy,
   Stack,
   StackProps,
   aws_iam as iam,
   aws_ec2 as ec2,
+  aws_s3 as s3,
   aws_elasticloadbalancingv2 as elbv2,
   aws_elasticloadbalancingv2_targets as elbv2Targets,
 } from "aws-cdk-lib";
@@ -126,6 +127,35 @@ export class NlbStack extends Stack {
       userDataProviderEC2InstanceParameter
     );
 
+    // Network ACL
+    const providerVPCIsolatedSubnetNetworkACL = new ec2.NetworkAcl(
+      this,
+      "Provider VPC Isolated subnet Network ACL",
+      {
+        vpc: providerVPC,
+        subnetSelection: {
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+        },
+      }
+    );
+    providerVPCIsolatedSubnetNetworkACL.addEntry(
+      "Allow ingress traffic from Provider VPC",
+      {
+        cidr: ec2.AclCidr.ipv4(providerVPC.vpcCidrBlock),
+        ruleNumber: 10,
+        traffic: ec2.AclTraffic.allTraffic(),
+        direction: ec2.TrafficDirection.INGRESS,
+        ruleAction: ec2.Action.ALLOW,
+      }
+    );
+    providerVPCIsolatedSubnetNetworkACL.addEntry("Allow all egress traffic", {
+      cidr: ec2.AclCidr.anyIpv4(),
+      ruleNumber: 20,
+      traffic: ec2.AclTraffic.allTraffic(),
+      direction: ec2.TrafficDirection.EGRESS,
+      ruleAction: ec2.Action.ALLOW,
+    });
+
     // Security Group
     const providerEC2InstanceSG = new ec2.SecurityGroup(
       this,
@@ -222,8 +252,6 @@ export class NlbStack extends Stack {
         userData: userDataProviderEC2Instance,
       }
     );
-    (providerEC2Instance.node.defaultChild as ec2.CfnInstance).ebsOptimized =
-      true;
 
     new ec2.Instance(this, "Consumer EC2 Instance on Provider VPC", {
       instanceType: new ec2.InstanceType("t3.micro"),
@@ -264,9 +292,20 @@ export class NlbStack extends Stack {
       vpcSubnets: consumerVPC.selectSubnets({
         subnetType: ec2.SubnetType.PUBLIC,
       }),
-      // securityGroup: consumerEC2InstanceSG,
       role: ssmIamRole,
     });
+
+    const albAccessLogBucket = new s3.Bucket(
+      this,
+      "Bucket for ALB access log",
+      {
+        encryption: s3.BucketEncryption.S3_MANAGED,
+        enforceSSL: true,
+        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        autoDeleteObjects: true,
+        removalPolicy: RemovalPolicy.DESTROY,
+      }
+    );
 
     // ALB
     const alb = new elbv2.ApplicationLoadBalancer(this, "ALB", {
@@ -276,6 +315,8 @@ export class NlbStack extends Stack {
       },
       securityGroup: albSG,
     });
+    alb.logAccessLogs(albAccessLogBucket);
+
     const albListener = alb.addListener("ALB Listener", {
       port: 80,
     });
